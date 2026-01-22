@@ -56,6 +56,7 @@
       <h2>保存データ</h2>
       <div class="row">
         <button id="btnExportCsv" class="btn">CSV出力</button>
+        <button id="btnExportZip" class="btn primary">CSV＋写真ZIP</button>
         <button id="btnClear" class="btn danger">全削除</button>
       </div>
 
@@ -67,7 +68,7 @@
       <ol>
         <li>GPS取得 → 写真撮影/選択 → 備考入力（必要なら音声）</li>
         <li>「この1件を保存」</li>
-        <li>現場が終わったら「CSV出力」→ QGISで読み込み（緯度/経度）</li>
+        <li>現場が終わったら「CSV出力」または「CSV＋写真ZIP」</li>
       </ol>
     </section>
   </main>
@@ -76,6 +77,8 @@
     <small>Local-first / PWA / GitHub Pages向け</small>
   </footer>
 
+  <!-- ZIP生成（JSZip）: 先に読み込む -->
+  <script src="./jszip.min.js"></script>
   <script type="module" src="./app.js"></script>
 </body>
 </html>
