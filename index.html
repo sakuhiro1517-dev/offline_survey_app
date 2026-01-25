@@ -15,6 +15,18 @@
   </header>
 
   <main class="container">
+
+    <section class="card">
+      <div><b>リスト設定（CSV読み込み）</b></div>
+      <div class="hint">PCで作ったCSVを読み込んで、地点/調査項目のプルダウンに反映します（端末内に保存されます）。</div>
+      <div class="row" style="margin-top:10px">
+        <input id="listCsvInput" type="file" accept=".csv,text/csv" />
+        <button id="btnClearLists" class="danger">リスト削除</button>
+      </div>
+      <div id="listStatus" class="hint"></div>
+      <div class="hint">CSV例: 1行目ヘッダ「地点,項目」</div>
+    </section>
+
     <section class="card">
       <div class="row">
         <input id="photoInput" type="file" accept="image/*" capture="environment" />
@@ -29,7 +41,31 @@
       </div>
 
       <div style="margin-top:10px">
-        <textarea id="memo" placeholder="備考（テキスト）"></textarea>
+        <div class="row">
+          <div style="flex:1; min-width:240px">
+            <div class="small">地点</div>
+            <select id="selLocation" class="select"></select>
+          </div>
+          <div style="flex:1; min-width:240px">
+            <div class="small">地点2</div>
+            <select id="selLocation2" class="select"></select>
+          </div>
+          <div style="flex:1; min-width:240px">
+            <div class="small">調査項目</div>
+            <select id="selItem" class="select"></select>
+          </div>
+        </div>
+
+        <div style="margin-top:10px">
+          <div class="small">備考（自由欄）</div>
+          <textarea id="memo" placeholder="備考（テキスト）"></textarea>
+        </div>
+
+        <div style="margin-top:10px">
+          <div class="small">備考2（追加の自由欄）</div>
+          <textarea id="memo2" placeholder="備考2（任意）"></textarea>
+        </div>
+
         <div class="hint">※ 音声入力は削除しました（端末依存が強く不安定なため）。</div>
       </div>
 

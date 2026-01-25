@@ -1,4 +1,9 @@
-// Offline Survey - full (v1.3)
+// Offline Survey - full (v1.4)
+// 追加:
+// - 地点/調査項目: プルダウン(select)
+// - CSV(地点,項目) を読み込んでリスト登録（端末内に保存）
+// - 備考2 追加
+// 既存:
 // - Camera photo + GPS + memo
 // - IndexedDB blob storage
 // - ZIP export: records.csv (UTF-8 BOM) + photos/ images
@@ -7,6 +12,15 @@
 const $ = (id) => document.getElementById(id);
 
 const els = {
+  // list config
+  listCsvInput: $("listCsvInput"),
+  btnClearLists: $("btnClearLists"),
+  listStatus: $("listStatus"),
+  selLocation: $("selLocation"),
+  selLocation2: $("selLocation2"),
+  selItem: $("selItem"),
+
+  // capture
   photoInput: $("photoInput"),
   btnGeo: $("btnGeo"),
   btnSave: $("btnSave"),
@@ -16,6 +30,7 @@ const els = {
   lng: $("lng"),
   acc: $("acc"),
   memo: $("memo"),
+  memo2: $("memo2"),
   preview: $("preview"),
   autoName: $("autoName"),
   ts: $("ts"),
@@ -83,6 +98,126 @@ function escapeHtml(s){
     .replaceAll('"',"&quot;")
     .replaceAll("'","&#39;");
 }
+function uniq(arr){
+  return Array.from(new Set(arr.filter(v => String(v).trim() !== "").map(v => String(v).trim())));
+}
+
+// ---- List storage (localStorage) ----
+const LIST_KEY = "fieldlog_lists_v1"; // {locations:[], items:[]}
+
+function loadLists(){
+  try{
+    const raw = localStorage.getItem(LIST_KEY);
+    if (!raw) return { locations: [], items: [] };
+    const obj = JSON.parse(raw);
+    return {
+      locations: Array.isArray(obj.locations) ? obj.locations : [],
+      items: Array.isArray(obj.items) ? obj.items : []
+    };
+  }catch(_){
+    return { locations: [], items: [] };
+  }
+}
+function saveLists(lists){
+  localStorage.setItem(LIST_KEY, JSON.stringify({
+    locations: lists.locations || [],
+    items: lists.items || []
+  }));
+}
+function setStatus(msg){
+  if (els.listStatus) els.listStatus.textContent = msg || "";
+}
+
+function fillSelect(selectEl, values, placeholder){
+  if (!selectEl) return;
+  selectEl.innerHTML = "";
+  const ph = document.createElement("option");
+  ph.value = "";
+  ph.textContent = placeholder;
+  selectEl.appendChild(ph);
+
+  for (const v of values){
+    const opt = document.createElement("option");
+    opt.value = v;
+    opt.textContent = v;
+    selectEl.appendChild(opt);
+  }
+}
+
+function refreshListUI(){
+  const lists = loadLists();
+  fillSelect(els.selLocation, lists.locations, "地点を選択");
+  fillSelect(els.selLocation2, lists.locations, "地点2を選択");
+  fillSelect(els.selItem, lists.items, "調査項目を選択");
+  setStatus(`登録済み: 地点 ${lists.locations.length} / 項目 ${lists.items.length}`);
+}
+
+async function parseListCsv(file){
+  // CSV: 1行目ヘッダ「地点,項目」
+  const text = await file.text();
+  const lines = text.replace(/\r\n/g,"\n").replace(/\r/g,"\n").split("\n").filter(l => l.trim() !== "");
+  if (lines.length < 2) throw new Error("CSVが空です");
+  const header = lines[0].split(",").map(s=>s.trim());
+  const idxLoc = header.indexOf("地点");
+  const idxItem = header.indexOf("項目");
+  if (idxLoc === -1 || idxItem === -1) throw new Error("ヘッダが「地点,項目」になっていません");
+
+  const locs = [];
+  const items = [];
+  for (let i=1;i<lines.length;i++){
+    // 簡易CSV（ダブルクォート対応は最低限）
+    const row = splitCsvLine(lines[i]);
+    if (row[idxLoc] != null) locs.push(row[idxLoc]);
+    if (row[idxItem] != null) items.push(row[idxItem]);
+  }
+  return { locations: uniq(locs), items: uniq(items) };
+}
+
+function splitCsvLine(line){
+  // minimal CSV splitter with quotes
+  const out = [];
+  let cur = "";
+  let inQ = false;
+  for (let i=0;i<line.length;i++){
+    const ch = line[i];
+    if (ch === '"'){
+      if (inQ && line[i+1] === '"'){ cur += '"'; i++; }
+      else inQ = !inQ;
+    }else if (ch === ',' && !inQ){
+      out.push(cur);
+      cur = "";
+    }else{
+      cur += ch;
+    }
+  }
+  out.push(cur);
+  return out.map(s => String(s ?? "").trim());
+}
+
+els.listCsvInput?.addEventListener("change", async () => {
+  const f = els.listCsvInput.files?.[0];
+  if (!f) return;
+  try{
+    setStatus("CSV読込中...");
+    const lists = await parseListCsv(f);
+    saveLists(lists);
+    refreshListUI();
+    setStatus("CSVを読み込みました ✅");
+  }catch(e){
+    console.error(e);
+    setStatus("");
+    alert("CSV読み込みに失敗: " + (e?.message || e));
+  }finally{
+    els.listCsvInput.value = "";
+  }
+});
+
+els.btnClearLists?.addEventListener("click", () => {
+  if (!confirm("地点/項目リストを削除します。よろしいですか？")) return;
+  saveLists({locations:[], items:[]});
+  refreshListUI();
+  setStatus("リストを削除しました");
+});
 
 // ---- IndexedDB ----
 const DB_NAME = "offline_survey_pwa_db";
@@ -176,6 +311,12 @@ els.btnSave?.addEventListener("click", async () => {
   if (!currentFile) { alert("写真を選択/撮影してください"); return; }
   if (!currentGeo) { alert("GPSを取得してください"); return; }
 
+  const location = (els.selLocation?.value || "").trim();
+  const location2 = (els.selLocation2?.value || "").trim();
+  const item = (els.selItem?.value || "").trim();
+  if (!location) { alert("地点を選択してください"); return; }
+  if (!item) { alert("調査項目を選択してください"); return; }
+
   const ts = currentTs ?? new Date();
   const base = formatTs(ts);
 
@@ -193,7 +334,11 @@ els.btnSave?.addEventListener("click", async () => {
     lat: currentGeo.coords.latitude,
     lng: currentGeo.coords.longitude,
     acc: currentGeo.coords.accuracy,
+    location,
+    location2,
+    item,
     memo: (els.memo.value || "").trim(),
+    memo2: (els.memo2.value || "").trim(),
     photoName,
     photoType: blob.type || "image/jpeg",
     photoBlob: blob
@@ -203,7 +348,10 @@ els.btnSave?.addEventListener("click", async () => {
     await dbPut(rec);
     // reset
     els.memo.value = "";
+    els.memo2.value = "";
     els.photoInput.value = "";
+    if (els.selItem) els.selItem.value = "";
+    // locationは連続入力しやすいように残す
     currentFile = null;
     currentGeo = null;
     currentTs = null;
@@ -245,8 +393,10 @@ async function renderList(){
     right.innerHTML = `
       <div><b>${r.photoName}</b></div>
       <div class="small mono">${d.toLocaleString()}</div>
-      <div class="small">lat: ${r.lat.toFixed(7)} / lng: ${r.lng.toFixed(7)} / acc: ${Math.round(r.acc)}m</div>
-      <div class="small">memo: ${escapeHtml(r.memo)}</div>
+      <div class="small">地点: ${escapeHtml(r.location || "")} / 地点2: ${escapeHtml(r.location2 || "")} / 項目: ${escapeHtml(r.item || "")}</div>
+      <div class="small">lat: ${Number(r.lat).toFixed(7)} / lng: ${Number(r.lng).toFixed(7)} / acc: ${Math.round(r.acc)}m</div>
+      <div class="small">備考: ${escapeHtml(r.memo || "")}</div>
+      <div class="small">備考2: ${escapeHtml(r.memo2 || "")}</div>
     `;
 
     wrap.appendChild(img);
@@ -392,16 +542,20 @@ els.btnExportZip?.addEventListener("click", async () => {
     const all = await dbGetAll();
     if (all.length === 0) { alert("保存データがありません"); return; }
 
-    const header = ["photo","createdAt","lat","lng","acc","memo"];
+    const header = ["photo","createdAt","location","location2","item","lat","lng","acc","memo","memo2"];
     const rows = [header.join(",")];
     for (const r of all){
       rows.push([
         escCsv(r.photoName),
         escCsv(r.createdAt),
+        escCsv(r.location || ""),
+        escCsv(r.location2 || ""),
+        escCsv(r.item || ""),
         escCsv(r.lat),
         escCsv(r.lng),
         escCsv(Math.round(r.acc)),
-        escCsv(r.memo)
+        escCsv(r.memo || ""),
+        escCsv(r.memo2 || "")
       ].join(","));
     }
     const csvText = "\uFEFF" + rows.join("\r\n");
@@ -440,6 +594,7 @@ els.btnClear?.addEventListener("click", async () => {
 
 // First render
 (async function(){
+  refreshListUI();
   updateAutoName();
   await renderList();
   try { els.swState.textContent += " / " + location.origin; } catch(_){}

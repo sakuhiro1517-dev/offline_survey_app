@@ -1,4 +1,4 @@
-const CACHE_NAME = "offline-survey-full-v1.3";
+const CACHE_NAME = "offline-survey-full-v1.5";
 const ASSETS = [
   "./",
   "./index.html",
