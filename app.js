@@ -358,11 +358,16 @@ async function exportZip() {
 
   const zip = new JSZip();
   const csvBlob = await exportCsvBlob(items);
-  zip.file("data.csv", csvBlob);
+  
+  // CSVの追加も待機する
+  await zip.file("data.csv", csvBlob);
 
   const folder = zip.folder("photos");
   for (const r of items) {
-    if (r.photoBlob) folder.file(r.photoName || `${r.id}.jpg`, r.photoBlob);
+    if (r.photoBlob) {
+      // ★ここが重要：非同期処理の完了を待機するように修正
+      await folder.file(r.photoName || `${r.id}.jpg`, r.photoBlob);
+    }
   }
 
   const outBlob = await zip.generateAsync({ type: "blob" });
@@ -375,7 +380,6 @@ async function exportZip() {
   a.remove();
   URL.revokeObjectURL(url);
 }
-
 // ---------- Service Worker ----------
 async function registerSW() {
   if (!("serviceWorker" in navigator)) return;
