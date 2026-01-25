@@ -102,6 +102,24 @@ function uniq(arr){
   return Array.from(new Set(arr.filter(v => String(v).trim() !== "").map(v => String(v).trim())));
 }
 
+function makeId(){
+  // crypto.randomUUID が無い端末向けフォールバック
+  if (typeof crypto !== "undefined") {
+    if (crypto.randomUUID) return crypto.randomUUID();
+    if (crypto.getRandomValues) {
+      const buf = new Uint8Array(16);
+      crypto.getRandomValues(buf);
+      // RFC4122 v4-ish
+      buf[6] = (buf[6] & 0x0f) | 0x40;
+      buf[8] = (buf[8] & 0x3f) | 0x80;
+      const hex = Array.from(buf).map(b => b.toString(16).padStart(2,"0")).join("");
+      return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
+    }
+  }
+  // 最終フォールバック
+  return "id-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+}
+
 // ---- List storage (localStorage) ----
 const LIST_KEY = "fieldlog_lists_v1"; // {locations:[], items:[]}
 
@@ -155,30 +173,59 @@ function refreshListUI(){
 }
 
 
-async function parseListCsv(file){
-  // CSV列ルール:
-  // A列 = 地点, B列 = 地点2, C列 = 項目
-  const text = await file.text();
-  const lines = text.replace(/
-/g,"
-").replace(//g,"
-").split("
-").filter(l => l.trim() !== "");
-  if (lines.length < 2) throw new Error("CSVが空です");
 
-  // ヘッダは使わず「列位置」で読む
+async function parseListCsv(file){
+  // CSV列ルール（列位置固定）:
+  // A列 = 地点, B列 = 地点2, C列 = 項目
+  // 文字コード: UTF-8/UTF-8(BOM)/Shift-JIS を自動で吸収（可能な範囲）
+  const ab = await file.arrayBuffer();
+  const u8 = new Uint8Array(ab);
+
+  function decodeWith(enc){
+    try{
+      const dec = new TextDecoder(enc, { fatal:false });
+      return dec.decode(u8);
+    }catch(_){
+      return null;
+    }
+  }
+
+  // 1) UTF-8優先
+  let text = decodeWith("utf-8") || "";
+  // 文字化けっぽい場合はShift-JISも試す（� が多い/区切りが見えない等）
+  const bad = (text.match(/\uFFFD/g) || []).length;
+  if (bad > 5 || (!text.includes(",") && !text.includes("，"))) {
+    const sjis = decodeWith("shift-jis");
+    if (sjis) text = sjis;
+  }
+
+  // 行分割
+  const lines = text.replace(/\r\n/g,"\n").replace(/\r/g,"\n").split("\n").filter(l => l.trim() !== "");
+  if (lines.length === 0) throw new Error("CSVが空です");
+
+  // 先頭行がヘッダっぽいなら飛ばす
+  const first = splitCsvLine(lines[0]).map(s => String(s||"").trim());
+  const isHeader =
+    (first[0] === "地点" || first[0] === "location") ||
+    (first[1] === "地点2" || first[1] === "location2") ||
+    (first[2] === "項目" || first[2] === "item");
+
+  const start = isHeader ? 1 : 0;
+
   const locs = [];
   const locs2 = [];
   const items = [];
 
-  for (let i=1;i<lines.length;i++){
+  for (let i=start;i<lines.length;i++){
     const row = splitCsvLine(lines[i]);
     if (row[0]) locs.push(row[0]);      // A列: 地点
     if (row[1]) locs2.push(row[1]);     // B列: 地点2
     if (row[2]) items.push(row[2]);     // C列: 項目
   }
+
   return { locations: uniq(locs), locations2: uniq(locs2), items: uniq(items) };
 }
+
 
 
 function splitCsvLine(line){
@@ -337,7 +384,7 @@ els.btnSave?.addEventListener("click", async () => {
   const blob = currentFile.type?.startsWith("image/") ? currentFile : new Blob([await currentFile.arrayBuffer()], { type: "image/jpeg" });
 
   const rec = {
-    id: crypto.randomUUID(),
+    id: makeId(),
     createdAt: ts.toISOString(),
     lat: currentGeo.coords.latitude,
     lng: currentGeo.coords.longitude,
