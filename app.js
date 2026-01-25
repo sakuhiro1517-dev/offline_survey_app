@@ -139,7 +139,7 @@ async function onPickPhoto(file) {
 function setupVoiceWarn() { $("voiceWarn").hidden = false; }
 
 function startVoice() {
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const SR = window.// SpeechRecognition disabled || window.webkit// SpeechRecognition disabled;
   if (!SR) {
     setupVoiceWarn();
     alert("このブラウザはWeb Speech音声認識に非対応です。");
