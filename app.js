@@ -1,425 +1,131 @@
-// FieldLog Mini (GitHub Pages / PWA / Offline-first)
-// 写真(Blob) + GPS + 備考(text) を IndexedDB に保存し、CSV と「CSV+写真ZIP」を生成します。
-// 依存: jszip.min.js（window.JSZip がある前提）
+// Offline Survey (minimal) - ZIP export fixed (v1.2)
+// - 音声入力なし
+// - ZIPダウンロードが 0KB になりやすい端末向けに、a要素append + 遅延revoke を実施
+// - ZIP内: records.csv(UTF-8 BOM) + photos/ に画像
+// 依存: なし（自前ZIP: store方式）
 
-const $ = (id) => document.getElementById(id);
+const logEl = document.getElementById("log");
+const photoEl = document.getElementById("photo");
+const btnSave = document.getElementById("save");
+const btnExport = document.getElementById("export");
 
-const state = {
-  lat: null,
-  lon: null,
-  acc: null,
-  ts: null,
-  photoBlob: null,
-  photoExt: null,
-  photoMime: null,
-  voice: { active: false, recognizer: null }
+function log(s){
+  logEl.textContent += s + "\n";
+}
+
+const records = []; // {name, blob, ts}
+
+function pad2(n){ return String(n).padStart(2,"0"); }
+function tsName(d){
+  return `${d.getFullYear()}${pad2(d.getMonth()+1)}${pad2(d.getDate())}_${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
+}
+
+btnSave.onclick = async () => {
+  const f = photoEl.files && photoEl.files[0];
+  if (!f) { alert("写真を選んでください"); return; }
+  const d = new Date();
+  const name = tsName(d) + ".jpg";
+  records.push({name, blob: f, ts: d.toISOString()});
+  photoEl.value = "";
+  log("saved: " + name + " (records=" + records.length + ")");
 };
 
-// ---------- IndexedDB ----------
-const DB_NAME = "fieldlog-mini-db";
-const DB_VER  = 1;
-const STORE   = "records";
-
-function openDb() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VER);
-    req.onupgradeneeded = () => {
-      const db = req.result;
-      if (!db.objectStoreNames.contains(STORE)) {
-        const os = db.createObjectStore(STORE, { keyPath: "id" });
-        os.createIndex("by_ts", "ts");
-      }
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
+// --------- ZIP (store) ----------
+function u32(n){ return new Uint8Array([n&255,(n>>8)&255,(n>>16)&255,(n>>24)&255]); }
+function u16(n){ return new Uint8Array([n&255,(n>>8)&255]); }
+function strU8(s){ return new TextEncoder().encode(s); }
+function concatU8(parts){
+  const len = parts.reduce((a,b)=>a+b.length,0);
+  const out = new Uint8Array(len);
+  let off=0;
+  for (const p of parts){ out.set(p, off); off += p.length; }
+  return out;
 }
 
-async function dbPut(record) {
-  const db = await openDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE, "readwrite");
-    tx.objectStore(STORE).put(record);
-    tx.oncomplete = () => resolve(true);
-    tx.onerror = () => reject(tx.error);
-  });
-}
+function makeZip(files){
+  // files: [{name, data(Uint8Array)}]
+  let offset = 0;
+  const locals = [];
+  const centrals = [];
 
-async function dbGetAll() {
-  const db = await openDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE, "readonly");
-    const req = tx.objectStore(STORE).getAll();
-    req.onsuccess = () => resolve(req.result || []);
-    req.onerror = () => reject(req.error);
-  });
-}
+  for (const f of files){
+    const nameU8 = strU8(f.name);
+    const data = f.data;
 
-async function dbDelete(id) {
-  const db = await openDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE, "readwrite");
-    tx.objectStore(STORE).delete(id);
-    tx.oncomplete = () => resolve(true);
-    tx.onerror = () => reject(tx.error);
-  });
-}
+    const lh = concatU8([
+      u32(0x04034b50), u16(20), u16(0), u16(0), u16(0), u16(0),
+      u32(0), u32(data.length), u32(data.length),
+      u16(nameU8.length), u16(0), nameU8
+    ]);
+    locals.push(lh, data);
 
-async function dbClear() {
-  const db = await openDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE, "readwrite");
-    tx.objectStore(STORE).clear();
-    tx.oncomplete = () => resolve(true);
-    tx.onerror = () => reject(tx.error);
-  });
-}
+    const ch = concatU8([
+      u32(0x02014b50), u16(20), u16(20), u16(0), u16(0), u16(0), u16(0),
+      u32(0), u32(data.length), u32(data.length),
+      u16(nameU8.length), u16(0), u16(0), u16(0), u16(0),
+      u32(0), u32(offset), nameU8
+    ]);
+    centrals.push(ch);
 
-// ---------- GPS ----------
-function nowIsoNoMs() {
-  const d = new Date();
-  d.setMilliseconds(0);
-  return d.toISOString();
-}
-
-function setGpsUI() {
-  $("lat").textContent = state.lat ?? "-";
-  $("lon").textContent = state.lon ?? "-";
-  $("acc").textContent = state.acc ?? "-";
-  $("ts").textContent  = state.ts  ?? "-";
-}
-
-async function getGps() {
-  if (!("geolocation" in navigator)) {
-    alert("このブラウザはGPS(Geolocation)に非対応です。");
-    return;
+    offset += lh.length + data.length;
   }
-  $("btnGps").disabled = true;
-  try {
-    const pos = await new Promise((resolve, reject) => {
-      navigator.geolocation.getCurrentPosition(resolve, reject, {
-        enableHighAccuracy: true,
-        timeout: 15000,
-        maximumAge: 0
-      });
-    });
-    state.lat = pos.coords.latitude.toFixed(7);
-    state.lon = pos.coords.longitude.toFixed(7);
-    state.acc = Math.round(pos.coords.accuracy);
-    state.ts  = nowIsoNoMs();
-    setGpsUI();
-  } catch (e) {
-    alert("GPS取得に失敗: " + (e?.message ?? e));
-  } finally {
-    $("btnGps").disabled = false;
-  }
+
+  const central = concatU8(centrals);
+  const end = concatU8([
+    u32(0x06054b50), u16(0), u16(0),
+    u16(files.length), u16(files.length),
+    u32(central.length), u32(offset), u16(0)
+  ]);
+
+  return concatU8([...locals, central, end]);
 }
 
-// ---------- Photo ----------
-function detectExtFromMime(mime) {
-  if (!mime) return "jpg";
-  if (mime.includes("png")) return "png";
-  if (mime.includes("webp")) return "webp";
-  return "jpg";
-}
-
-async function onPickPhoto(file) {
-  if (!file) return;
-  state.photoBlob = file;
-  state.photoMime = file.type || "image/jpeg";
-  state.photoExt  = detectExtFromMime(file.type);
-
-  const url = URL.createObjectURL(file);
-  const img = $("preview");
-  img.src = url;
-  img.style.display = "block";
-}
-
-// ---------- Voice (optional) ----------
-function setupVoiceWarn() { $("voiceWarn").hidden = false; }
-
-function startVoice() {
-  const SR = window.// SpeechRecognition disabled || window.webkit// SpeechRecognition disabled;
-  if (!SR) {
-    setupVoiceWarn();
-    alert("このブラウザはWeb Speech音声認識に非対応です。");
-    return;
-  }
-  setupVoiceWarn();
-
-  const rec = new SR();
-  rec.lang = "ja-JP";
-  rec.interimResults = true;
-  rec.continuous = true;
-
-  rec.onresult = (ev) => {
-    let finalText = "";
-    for (let i = ev.resultIndex; i < ev.results.length; i++) {
-      const r = ev.results[i];
-      if (r.isFinal) finalText += r[0].transcript;
-    }
-    if (finalText) {
-      const ta = $("note");
-      ta.value = (ta.value + (ta.value ? "\n" : "") + finalText).trim();
-    }
-  };
-
-  rec.onerror = () => stopVoice();
-  rec.onend = () => { if (state.voice.active) stopVoice(); };
-
-  state.voice.recognizer = rec;
-  state.voice.active = true;
-  $("btnVoice").textContent = "⏹ 音声入力停止";
-  rec.start();
-}
-
-function stopVoice() {
-  const rec = state.voice.recognizer;
-  state.voice.active = false;
-  state.voice.recognizer = null;
-  $("btnVoice").textContent = "🎙 音声入力開始";
-  try { rec?.stop(); } catch {}
-}
-
-// ---------- Save / List ----------
-function pad2(n){ return String(n).padStart(2,"0"); }
-
-function makeId() {
-  const d = new Date();
-  return [
-    d.getFullYear(),
-    pad2(d.getMonth()+1),
-    pad2(d.getDate()),
-    "_",
-    pad2(d.getHours()),
-    pad2(d.getMinutes()),
-    pad2(d.getSeconds()),
-    "_",
-    Math.random().toString(16).slice(2,8)
-  ].join("");
-}
-
-function csvEscape(s) {
-  const t = String(s ?? "");
-  if (/[,"\n\r]/.test(t)) return '"' + t.replace(/"/g,'""') + '"';
-  return t;
-}
-
-async function saveCurrent() {
-  if (!state.lat || !state.lon) {
-    alert("先にGPS取得してください。");
-    return;
-  }
-  if (!state.photoBlob) {
-    alert("先に写真を選択/撮影してください。");
-    return;
-  }
-  const id = makeId();
-  const ts = state.ts ?? nowIsoNoMs();
-  const photoName = `${id}.${state.photoExt ?? "jpg"}`;
-
-  const record = {
-    id,
-    ts,
-    lat: Number(state.lat),
-    lon: Number(state.lon),
-    acc: state.acc != null ? Number(state.acc) : null,
-    note: $("note").value ?? "",
-    photoName,
-    photoMime: state.photoMime ?? "image/jpeg",
-    photoBlob: state.photoBlob
-  };
-
-  await dbPut(record);
-
-  $("note").value = "";
-  state.photoBlob = null;
-  const img = $("preview");
-  img.removeAttribute("src");
-  img.style.display = "none";
-
-  await renderList();
-}
-
-function human(ts){
-  try { return new Date(ts).toLocaleString(); } catch { return ts; }
-}
-
-async function downloadPhoto(rec) {
-  const blob = rec.photoBlob;
-  if (!blob) return;
+function downloadBlob(blob, filename){
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = rec.photoName || "photo.jpg";
+  a.download = filename;
+  a.style.display = "none";
   document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-}
 
-async function renderList() {
-  const list = $("list");
-  list.innerHTML = "";
-  const items = await dbGetAll();
-  items.sort((a,b) => (b.ts||"").localeCompare(a.ts||""));
-
-  if (items.length === 0) {
-    list.innerHTML = `<div class="item"><small>まだ0件です。</small></div>`;
-    return;
-  }
-
-  for (const rec of items) {
-    const el = document.createElement("div");
-    el.className = "item";
-    el.innerHTML = `
-      <div class="itemTop">
-        <div>
-          <div><b>${csvEscape(human(rec.ts))}</b></div>
-          <small>lat ${rec.lat} / lon ${rec.lon} / acc ${rec.acc ?? "-"}m</small>
-        </div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <button data-act="photo" data-id="${rec.id}">写真DL</button>
-          <button data-act="del" data-id="${rec.id}">削除</button>
-        </div>
-      </div>
-      <div style="margin-top:8px;white-space:pre-wrap;color:#ddd">${(rec.note ?? "").slice(0,500)}</div>
-      <small>photo: ${rec.photoName ?? "-"}</small>
-    `;
-    list.appendChild(el);
-  }
-
-  list.querySelectorAll("button[data-act]").forEach(btn => {
-    btn.addEventListener("click", async () => {
-      const id = btn.getAttribute("data-id");
-      const act = btn.getAttribute("data-act");
-      const all = await dbGetAll();
-      const rec = all.find(x => x.id === id);
-      if (!rec) return;
-
-      if (act === "del") {
-        if (!confirm("この1件を削除しますか？")) return;
-        await dbDelete(id);
-        await renderList();
-      } else if (act === "photo") {
-        await downloadPhoto(rec);
-      }
-    });
+  // iOS対策: DOMに入れてから遅延クリック
+  requestAnimationFrame(() => {
+    setTimeout(() => {
+      a.click();
+      // revokeを急ぐと0KBになりやすい端末があるので遅らせる
+      setTimeout(() => {
+        URL.revokeObjectURL(url);
+        a.remove();
+      }, 5000);
+    }, 50);
   });
 }
 
-// ---------- CSV Export ----------
-async function exportCsvBlob(items) {
-  const header = ["id","timestamp","lat","lon","accuracy_m","note","photoName"].join(",");
-  const lines = [header];
+btnExport.onclick = async () => {
+  if (records.length === 0) { alert("0件"); return; }
 
-  // oldest first
-  items.sort((a,b) => (a.ts||"").localeCompare(b.ts||""));
+  // CSV (UTF-8 BOM) : photo, ts
+  const header = "photo,ts";
+  const lines = [header, ...records.map(r => `${r.name},${r.ts}`)];
+  const csvText = "\uFEFF" + lines.join("\r\n");
+  const csvU8 = strU8(csvText);
 
-  for (const r of items) {
-    lines.push([
-      csvEscape(r.id),
-      csvEscape(r.ts),
-      csvEscape(r.lat),
-      csvEscape(r.lon),
-      csvEscape(r.acc ?? ""),
-      csvEscape(r.note ?? ""),
-      csvEscape(r.photoName ?? "")
-    ].join(","));
-  }
-  const csv = lines.join("\r\n");
-  return new Blob([csv], { type: "text/csv;charset=utf-8" });
-}
+  const files = [];
+  files.push({ name: "records.csv", data: csvU8 });
 
-async function exportCsv() {
-  const items = await dbGetAll();
-  if (items.length === 0) { alert("データが0件です。"); return; }
-
-  const blob = await exportCsvBlob(items);
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `fieldlog_${new Date().toISOString().slice(0,10)}.csv`;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-}
-
-// ---------- ZIP Export (CSV + photos) ----------
-async function exportZip() {
-  const JSZip = window.JSZip;
-  if (!JSZip) {
-    alert("JSZip が読み込めていません。index.html に <script src='./jszip.min.js'></script> を追加してください。");
-    return;
-  }
-  const items = await dbGetAll();
-  if (items.length === 0) { alert("データが0件です。"); return; }
-
-  const zip = new JSZip();
-  const csvBlob = await exportCsvBlob(items);
-  
-  // CSVの追加も待機する
-  await zip.file("data.csv", csvBlob);
-
-  const folder = zip.folder("photos");
-  for (const r of items) {
-    if (r.photoBlob) {
-      // ★ここが重要：非同期処理の完了を待機するように修正
-      await folder.file(r.photoName || `${r.id}.jpg`, r.photoBlob);
-    }
+  for (const r of records){
+    const ab = new Uint8Array(await r.blob.arrayBuffer());
+    files.push({ name: "photos/" + r.name, data: ab });
   }
 
-  const outBlob = await zip.generateAsync({ type: "blob" });
-  const url = URL.createObjectURL(outBlob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `fieldlog_${new Date().toISOString().slice(0,10)}.zip`;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-}
-// ---------- Service Worker ----------
-async function registerSW() {
-  if (!("serviceWorker" in navigator)) return;
-  try {
-    await navigator.serviceWorker.register("./sw.js", { scope: "./" });
-  } catch (e) {
-    console.warn("SW register failed", e);
+  const zipU8 = makeZip(files);
+  const blob = new Blob([zipU8], { type: "application/zip" });
+
+  log("ZIP size: " + blob.size + " bytes");
+  if (blob.size < 200) {
+    alert("ZIPが小さすぎます（失敗の可能性）。端末/ブラウザを変えて再試行してください。");
   }
-}
 
-// ---------- UI wiring ----------
-$("btnGps")?.addEventListener("click", getGps);
-
-$("photo")?.addEventListener("change", (e) => {
-  const f = e.target.files?.[0];
-  onPickPhoto(f);
-});
-
-$("btnVoice")?.addEventListener("click", () => {
-  if (state.voice.active) stopVoice();
-  else startVoice();
-});
-
-$("btnSave")?.addEventListener("click", async () => {
-  $("btnSave").disabled = true;
-  try { await saveCurrent(); }
-  finally { $("btnSave").disabled = false; }
-});
-
-$("btnExportCsv")?.addEventListener("click", exportCsv);
-$("btnExportZip")?.addEventListener("click", exportZip);
-
-$("btnClear")?.addEventListener("click", async () => {
-  if (!confirm("全データを削除しますか？")) return;
-  await dbClear();
-  await renderList();
-});
-
-window.addEventListener("load", async () => {
-  setGpsUI();
-  await renderList();
-  await registerSW();
-});
+  const fname = "export_" + new Date().toISOString().slice(0,10) + ".zip";
+  downloadBlob(blob, fname);
+};
