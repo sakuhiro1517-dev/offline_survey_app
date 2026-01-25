@@ -1,5 +1,5 @@
 // very small PWA cache (app shell)
-const CACHE = "fieldlog-mini-v2"; // <- bump here when you update files
+const CACHE = "fieldlog-mini-v3"; // <- bump here when you update files
 const ASSETS = [
   "./",
   "./index.html",
