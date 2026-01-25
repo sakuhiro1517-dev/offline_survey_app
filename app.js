@@ -108,19 +108,21 @@ const LIST_KEY = "fieldlog_lists_v1"; // {locations:[], items:[]}
 function loadLists(){
   try{
     const raw = localStorage.getItem(LIST_KEY);
-    if (!raw) return { locations: [], items: [] };
+    if (!raw) return { locations: [], locations2: [], items: [] };
     const obj = JSON.parse(raw);
     return {
       locations: Array.isArray(obj.locations) ? obj.locations : [],
+      locations2: Array.isArray(obj.locations2) ? obj.locations2 : [],
       items: Array.isArray(obj.items) ? obj.items : []
     };
   }catch(_){
-    return { locations: [], items: [] };
+    return { locations: [], locations2: [], items: [] };
   }
 }
 function saveLists(lists){
   localStorage.setItem(LIST_KEY, JSON.stringify({
     locations: lists.locations || [],
+    locations2: lists.locations2 || [],
     items: lists.items || []
   }));
 }
@@ -147,31 +149,37 @@ function fillSelect(selectEl, values, placeholder){
 function refreshListUI(){
   const lists = loadLists();
   fillSelect(els.selLocation, lists.locations, "地点を選択");
-  fillSelect(els.selLocation2, lists.locations, "地点2を選択");
+  fillSelect(els.selLocation2, lists.locations2, "地点2を選択");
   fillSelect(els.selItem, lists.items, "調査項目を選択");
-  setStatus(`登録済み: 地点 ${lists.locations.length} / 項目 ${lists.items.length}`);
+  setStatus(`登録済み: 地点 ${lists.locations.length} / 地点2 ${lists.locations2.length} / 項目 ${lists.items.length}`);
 }
+
 
 async function parseListCsv(file){
-  // CSV: 1行目ヘッダ「地点,項目」
+  // CSV列ルール:
+  // A列 = 地点, B列 = 地点2, C列 = 項目
   const text = await file.text();
-  const lines = text.replace(/\r\n/g,"\n").replace(/\r/g,"\n").split("\n").filter(l => l.trim() !== "");
+  const lines = text.replace(/
+/g,"
+").replace(//g,"
+").split("
+").filter(l => l.trim() !== "");
   if (lines.length < 2) throw new Error("CSVが空です");
-  const header = lines[0].split(",").map(s=>s.trim());
-  const idxLoc = header.indexOf("地点");
-  const idxItem = header.indexOf("項目");
-  if (idxLoc === -1 || idxItem === -1) throw new Error("ヘッダが「地点,項目」になっていません");
 
+  // ヘッダは使わず「列位置」で読む
   const locs = [];
+  const locs2 = [];
   const items = [];
+
   for (let i=1;i<lines.length;i++){
-    // 簡易CSV（ダブルクォート対応は最低限）
     const row = splitCsvLine(lines[i]);
-    if (row[idxLoc] != null) locs.push(row[idxLoc]);
-    if (row[idxItem] != null) items.push(row[idxItem]);
+    if (row[0]) locs.push(row[0]);      // A列: 地点
+    if (row[1]) locs2.push(row[1]);     // B列: 地点2
+    if (row[2]) items.push(row[2]);     // C列: 項目
   }
-  return { locations: uniq(locs), items: uniq(items) };
+  return { locations: uniq(locs), locations2: uniq(locs2), items: uniq(items) };
 }
+
 
 function splitCsvLine(line){
   // minimal CSV splitter with quotes
