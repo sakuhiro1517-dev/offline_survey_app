@@ -1,3 +1,6 @@
+const APP_VERSION = "v2.0";
+console.log("Offline Survey", APP_VERSION);
+
 // Offline Survey - full (v1.4)
 // 追加:
 // - 地点/調査項目: プルダウン(select)
@@ -49,7 +52,7 @@ window.addEventListener("beforeinstallprompt", (e) => {
   deferredPrompt = e;
   if (els.btnInstall) els.btnInstall.style.display = "inline-block";
 });
-els.btnInstall?.addEventListener("click", async () => {
+if (els.btnInstall) els.btnInstall.addEventListener("click", async () => {
   if (!deferredPrompt) return;
   deferredPrompt.prompt();
   await deferredPrompt.userChoice;
@@ -63,7 +66,7 @@ els.btnInstall?.addEventListener("click", async () => {
   try{
     const reg = await navigator.serviceWorker.register("./sw.js");
     els.swState.textContent = "SW: registered";
-    reg.update?.();
+    if (reg && reg.update) reg.update();
   }catch(e){
     els.swState.textContent = "SW: failed";
   }
@@ -75,9 +78,9 @@ function formatTs(d){
   return `${d.getFullYear()}${pad2(d.getMonth()+1)}${pad2(d.getDate())}_${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
 }
 function setGeoUI(pos){
-  els.lat.textContent = pos?.coords?.latitude?.toFixed(7) ?? "-";
-  els.lng.textContent = pos?.coords?.longitude?.toFixed(7) ?? "-";
-  els.acc.textContent = Math.round(pos?.coords?.accuracy ?? 0) || "-";
+  els.lat.textContent = (pos && pos.coords && typeof pos.coords.latitude==="number") ? pos.coords.latitude.toFixed(7) : "-";
+  els.lng.textContent = (pos && pos.coords && typeof pos.coords.longitude==="number") ? pos.coords.longitude.toFixed(7) : "-";
+  els.acc.textContent = (pos && pos.coords && typeof pos.coords.accuracy==="number") ? Math.round(pos.coords.accuracy) : "-";
 }
 function setPreviewFromFile(file){
   if (!file) { els.preview.src = ""; return; }
@@ -86,38 +89,32 @@ function setPreviewFromFile(file){
   setTimeout(()=>URL.revokeObjectURL(url), 60000);
 }
 function escCsv(v){
-  const s = String(v ?? "");
+  const s = String((v === undefined || v === null) ? "" : v);
   if (/[",\n\r]/.test(s)) return '"' + s.replace(/"/g,'""') + '"';
   return s;
 }
 function escapeHtml(s){
-  return String(s ?? "")
-    .replaceAll("&","&amp;")
-    .replaceAll("<","&lt;")
-    .replaceAll(">","&gt;")
-    .replaceAll('"',"&quot;")
-    .replaceAll("'","&#39;");
+  return String((s === undefined || s === null) ? "" : s)
+    .replace(/&/g,"&amp;")
+    .replace(/</g,"&lt;")
+    .replace(/>/g,"&gt;")
+    .replace(/"/g,"&quot;")
+    .replace(/'/g,"&#39;");
 }
 function uniq(arr){
   return Array.from(new Set(arr.filter(v => String(v).trim() !== "").map(v => String(v).trim())));
 }
 
 function makeId(){
-  // crypto.randomUUID が無い端末向けフォールバック
-  if (typeof crypto !== "undefined") {
-    if (crypto.randomUUID) return crypto.randomUUID();
-    if (crypto.getRandomValues) {
-      const buf = new Uint8Array(16);
-      crypto.getRandomValues(buf);
-      // RFC4122 v4-ish
-      buf[6] = (buf[6] & 0x0f) | 0x40;
-      buf[8] = (buf[8] & 0x3f) | 0x80;
-      const hex = Array.from(buf).map(b => b.toString(16).padStart(2,"0")).join("");
-      return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
-    }
+  // Android 9 / 古いChromeでも動くID
+  if (window.crypto && crypto.getRandomValues){
+    const buf = new Uint8Array(16);
+    crypto.getRandomValues(buf);
+    let s = "";
+    for (let i=0;i<buf.length;i++){ s += ("0" + buf[i].toString(16)).slice(-2); }
+    return s;
   }
-  // 最終フォールバック
-  return "id-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+  return "id_" + Date.now() + "_" + Math.floor(Math.random()*1e9);
 }
 
 // ---- List storage (localStorage) ----
@@ -204,7 +201,7 @@ async function parseListCsv(file){
   if (lines.length === 0) throw new Error("CSVが空です");
 
   // 先頭行がヘッダっぽいなら飛ばす
-  const first = splitCsvLine(lines[0]).map(s => String(s||"").trim());
+  const first = splitCsvLine(lines[0]).map(s => String(s || "").trim());
   const isHeader =
     (first[0] === "地点" || first[0] === "location") ||
     (first[1] === "地点2" || first[1] === "location2") ||
@@ -246,11 +243,11 @@ function splitCsvLine(line){
     }
   }
   out.push(cur);
-  return out.map(s => String(s ?? "").trim());
+  return out.map(s => String((s === undefined || s === null) ? "" : s).trim());
 }
 
-els.listCsvInput?.addEventListener("change", async () => {
-  const f = els.listCsvInput.files?.[0];
+if (els.listCsvInput) els.listCsvInput.addEventListener("change", async () => {
+  const f = (els.listCsvInput.files && els.listCsvInput.files[0]);
   if (!f) return;
   try{
     setStatus("CSV読込中...");
@@ -261,13 +258,13 @@ els.listCsvInput?.addEventListener("change", async () => {
   }catch(e){
     console.error(e);
     setStatus("");
-    alert("CSV読み込みに失敗: " + (e?.message || e));
+    alert("CSV読み込みに失敗: " + ((e && e.message) ? e.message : e));
   }finally{
     els.listCsvInput.value = "";
   }
 });
 
-els.btnClearLists?.addEventListener("click", () => {
+if (els.btnClearLists) els.btnClearLists.addEventListener("click", () => {
   if (!confirm("地点/項目リストを削除します。よろしいですか？")) return;
   saveLists({locations:[], items:[]});
   refreshListUI();
@@ -334,14 +331,14 @@ function updateAutoName(){
 }
 
 // ---- Events ----
-els.photoInput?.addEventListener("change", () => {
-  currentFile = els.photoInput.files?.[0] ?? null;
+if (els.photoInput) els.photoInput.addEventListener("change", () => {
+  currentFile = ((els.photoInput.files && els.photoInput.files[0]) ? els.photoInput.files[0] : null);
   currentTs = new Date();
   updateAutoName();
   setPreviewFromFile(currentFile);
 });
 
-els.btnGeo?.addEventListener("click", async () => {
+if (els.btnGeo) els.btnGeo.addEventListener("click", async () => {
   els.btnGeo.disabled = true;
   els.btnGeo.textContent = "GPS取得中...";
   try {
@@ -362,17 +359,17 @@ els.btnGeo?.addEventListener("click", async () => {
   }
 });
 
-els.btnSave?.addEventListener("click", async () => {
+if (els.btnSave) els.btnSave.addEventListener("click", async () => {
   if (!currentFile) { alert("写真を選択/撮影してください"); return; }
   if (!currentGeo) { alert("GPSを取得してください"); return; }
 
-  const location = (els.selLocation?.value || "").trim();
-  const location2 = (els.selLocation2?.value || "").trim();
-  const item = (els.selItem?.value || "").trim();
+  const location = ((els.selLocation && els.selLocation.value) ? els.selLocation.value : "").trim();
+  const location2 = ((els.selLocation2 && els.selLocation2.value) ? els.selLocation2.value : "").trim();
+  const item = ((els.selItem && els.selItem.value) ? els.selItem.value : "").trim();
   if (!location) { alert("地点を選択してください"); return; }
   if (!item) { alert("調査項目を選択してください"); return; }
 
-  const ts = currentTs ?? new Date();
+  const ts = (currentTs ? currentTs : new Date());
   const base = formatTs(ts);
 
   // 枝番：同秒の既存件数+1
@@ -381,7 +378,7 @@ els.btnSave?.addEventListener("click", async () => {
   const seq = sameSec + 1;
   const photoName = `${base}-${pad2(seq)}.jpg`;
 
-  const blob = currentFile.type?.startsWith("image/") ? currentFile : new Blob([await currentFile.arrayBuffer()], { type: "image/jpeg" });
+  const blob = (currentFile.type && currentFile.type.indexOf("image/") === 0) ? currentFile : new Blob([await currentFile.arrayBuffer()], { type: "image/jpeg" });
 
   const rec = {
     id: makeId(),
@@ -590,7 +587,7 @@ function downloadBlob(blob, filename){
   });
 }
 
-els.btnExportZip?.addEventListener("click", async () => {
+if (els.btnExportZip) els.btnExportZip.addEventListener("click", async () => {
   els.btnExportZip.disabled = true;
   els.exportStatus.textContent = "ZIP生成中...";
   try {
@@ -640,7 +637,7 @@ els.btnExportZip?.addEventListener("click", async () => {
   }
 });
 
-els.btnClear?.addEventListener("click", async () => {
+if (els.btnClear) els.btnClear.addEventListener("click", async () => {
   if (!confirm("全データを削除します。よろしいですか？")) return;
   await dbClear();
   await renderList();
