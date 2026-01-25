@@ -1,38 +1,49 @@
-// very small PWA cache (app shell)
-const CACHE = "fieldlog-mini-v2"; // <- bump here when you update files
+const CACHE_NAME = "offline-survey-full-v1.3";
 const ASSETS = [
   "./",
   "./index.html",
-  "./styles.css",
   "./app.js",
+  "./styles.css",
   "./manifest.webmanifest",
   "./icon-192.png",
-  "./icon-512.png",
-  "./jszip.min.js",
+  "./icon-512.png"
 ];
 
-self.addEventListener("install", (e) => {
-  e.waitUntil(
-    caches.open(CACHE).then((c) => c.addAll(ASSETS)).then(() => self.skipWaiting())
-  );
+self.addEventListener("install", (event) => {
+  event.waitUntil((async () => {
+    const cache = await caches.open(CACHE_NAME);
+    await cache.addAll(ASSETS);
+    self.skipWaiting();
+  })());
 });
 
-self.addEventListener("activate", (e) => {
-  e.waitUntil(
-    caches.keys().then(keys => Promise.all(keys.map(k => (k === CACHE) ? null : caches.delete(k))))
-      .then(() => self.clients.claim())
-  );
+self.addEventListener("activate", (event) => {
+  event.waitUntil((async () => {
+    const keys = await caches.keys();
+    await Promise.all(keys.map(k => (k !== CACHE_NAME) ? caches.delete(k) : Promise.resolve()));
+    self.clients.claim();
+  })());
 });
 
-self.addEventListener("fetch", (e) => {
-  const req = e.request;
-  if (req.mode === "navigate") {
-    e.respondWith(
-      caches.match("./index.html").then((cached) => cached || fetch(req))
-    );
-    return;
-  }
-  e.respondWith(
-    caches.match(req).then((cached) => cached || fetch(req))
-  );
+self.addEventListener("fetch", (event) => {
+  const req = event.request;
+  event.respondWith((async () => {
+    const cached = await caches.match(req, { ignoreSearch: true });
+    if (cached) return cached;
+    try {
+      const res = await fetch(req);
+      const url = new URL(req.url);
+      if (url.origin === location.origin && req.method === "GET") {
+        const cache = await caches.open(CACHE_NAME);
+        cache.put(req, res.clone());
+      }
+      return res;
+    } catch (e) {
+      if (req.mode === "navigate") {
+        const c = await caches.match("./index.html");
+        if (c) return c;
+      }
+      throw e;
+    }
+  })());
 });

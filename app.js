@@ -1,243 +1,446 @@
-// FieldLog Mini (Fixed ZIP Version)
+// Offline Survey - full (v1.3)
+// - Camera photo + GPS + memo
+// - IndexedDB blob storage
+// - ZIP export: records.csv (UTF-8 BOM) + photos/ images
+// - Download 0KB対策: append + 遅延revoke
+
 const $ = (id) => document.getElementById(id);
 
-const state = {
-  lat: null,
-  lon: null,
-  acc: null,
-  ts: null,
-  photoBlob: null,
-  photoExt: null,
-  photoMime: null,
-  voice: { active: false, recognizer: null }
+const els = {
+  photoInput: $("photoInput"),
+  btnGeo: $("btnGeo"),
+  btnSave: $("btnSave"),
+  btnExportZip: $("btnExportZip"),
+  btnClear: $("btnClear"),
+  lat: $("lat"),
+  lng: $("lng"),
+  acc: $("acc"),
+  memo: $("memo"),
+  preview: $("preview"),
+  autoName: $("autoName"),
+  ts: $("ts"),
+  list: $("list"),
+  count: $("count"),
+  exportStatus: $("exportStatus"),
+  swState: $("swState"),
+  btnInstall: $("btnInstall"),
 };
 
-// ---------- IndexedDB ----------
-const DB_NAME = "fieldlog-mini-db";
-const DB_VER  = 1;
-const STORE   = \"records\";
+let deferredPrompt = null;
 
-function openDb() {
+// ---- Install prompt ----
+window.addEventListener("beforeinstallprompt", (e) => {
+  e.preventDefault();
+  deferredPrompt = e;
+  if (els.btnInstall) els.btnInstall.style.display = "inline-block";
+});
+els.btnInstall?.addEventListener("click", async () => {
+  if (!deferredPrompt) return;
+  deferredPrompt.prompt();
+  await deferredPrompt.userChoice;
+  deferredPrompt = null;
+  els.btnInstall.style.display = "none";
+});
+
+// ---- SW ----
+(async function initSW(){
+  if (!("serviceWorker" in navigator)) return;
+  try{
+    const reg = await navigator.serviceWorker.register("./sw.js");
+    els.swState.textContent = "SW: registered";
+    reg.update?.();
+  }catch(e){
+    els.swState.textContent = "SW: failed";
+  }
+})();
+
+// ---- Helpers ----
+function pad2(n){ return String(n).padStart(2,"0"); }
+function formatTs(d){
+  return `${d.getFullYear()}${pad2(d.getMonth()+1)}${pad2(d.getDate())}_${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
+}
+function setGeoUI(pos){
+  els.lat.textContent = pos?.coords?.latitude?.toFixed(7) ?? "-";
+  els.lng.textContent = pos?.coords?.longitude?.toFixed(7) ?? "-";
+  els.acc.textContent = Math.round(pos?.coords?.accuracy ?? 0) || "-";
+}
+function setPreviewFromFile(file){
+  if (!file) { els.preview.src = ""; return; }
+  const url = URL.createObjectURL(file);
+  els.preview.src = url;
+  setTimeout(()=>URL.revokeObjectURL(url), 60000);
+}
+function escCsv(v){
+  const s = String(v ?? "");
+  if (/[",\n\r]/.test(s)) return '"' + s.replace(/"/g,'""') + '"';
+  return s;
+}
+function escapeHtml(s){
+  return String(s ?? "")
+    .replaceAll("&","&amp;")
+    .replaceAll("<","&lt;")
+    .replaceAll(">","&gt;")
+    .replaceAll('"',"&quot;")
+    .replaceAll("'","&#39;");
+}
+
+// ---- IndexedDB ----
+const DB_NAME = "offline_survey_pwa_db";
+const DB_VER = 1;
+const STORE = "records";
+
+function openDB(){
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VER);
     req.onupgradeneeded = () => {
       const db = req.result;
       if (!db.objectStoreNames.contains(STORE)) {
-        const os = db.createObjectStore(STORE, { keyPath: \"id\" });
-        os.createIndex(\"by_ts\", \"ts\");
+        const os = db.createObjectStore(STORE, { keyPath: "id" });
+        os.createIndex("createdAt", "createdAt");
       }
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
 }
-
-async function dbPut(record) {
-  const db = await openDb();
+async function dbPut(record){
+  const db = await openDB();
   return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE, \"readwrite\");
+    const tx = db.transaction(STORE, "readwrite");
     tx.objectStore(STORE).put(record);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { const e = tx.error; db.close(); reject(e); };
   });
 }
-
-async function dbGetAll() {
-  const db = await openDb();
+async function dbGetAll(){
+  const db = await openDB();
   return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE, \"readonly\");
+    const tx = db.transaction(STORE, "readonly");
     const req = tx.objectStore(STORE).getAll();
-    req.onsuccess = () => resolve(req.result.sort((a,b) => b.ts - a.ts));
-    req.onerror = () => reject(req.error);
+    req.onsuccess = () => { const v = req.result || []; db.close(); resolve(v); };
+    req.onerror = () => { const e = req.error; db.close(); reject(e); };
+  });
+}
+async function dbClear(){
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, "readwrite");
+    tx.objectStore(STORE).clear();
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { const e = tx.error; db.close(); reject(e); };
   });
 }
 
-async function dbClear() {
-  if (!confirm(\"すべてのデータを削除しますか？\")) return;
-  const db = await openDb();
-  const tx = db.transaction(STORE, \"readwrite\");
-  tx.objectStore(STORE).clear();
-  tx.oncomplete = () => { alert(\"削除しました\"); renderList(); };
+// ---- State ----
+let currentFile = null;
+let currentGeo = null;
+let currentTs = null;
+
+function updateAutoName(){
+  if (!currentTs) { els.autoName.textContent = "-"; els.ts.textContent = "-"; return; }
+  const base = formatTs(currentTs);
+  els.autoName.textContent = `${base}-01.jpg`; // 表示用
+  els.ts.textContent = currentTs.toLocaleString();
 }
 
-// ---------- GPS ----------
-function getGps() {
-  if (!navigator.geolocation) return alert(\"GPS非対応です\");
-  $(\"btnGps\").innerText = \"取得中...\";
-  navigator.geolocation.getCurrentPosition(
-    (p) => {
-      state.lat = p.coords.latitude.toFixed(7);
-      state.lon = p.coords.longitude.toFixed(7);
-      state.acc = p.coords.accuracy.toFixed(1);
-      state.ts  = p.timestamp;
-      $(\"lat\").innerText = state.lat;
-      $(\"lon\").innerText = state.lon;
-      $(\"acc\").innerText = state.acc;
-      $(\"ts\").innerText = new Date(state.ts).toLocaleString();
-      $(\"btnGps\").innerText = \"GPS再取得\";
-    },
-    (e) => {
-      alert(\"GPS取得失敗: \" + e.message);
-      $(\"btnGps\").innerText = \"GPS取得\";
-    },
-    { enableHighAccuracy: true, timeout: 10000 }
-  );
-}
+// ---- Events ----
+els.photoInput?.addEventListener("change", () => {
+  currentFile = els.photoInput.files?.[0] ?? null;
+  currentTs = new Date();
+  updateAutoName();
+  setPreviewFromFile(currentFile);
+});
 
-// ---------- Photo ----------
-async function onPickPhoto(file) {
-  if (!file) return;
-  state.photoMime = file.type;
-  state.photoExt = file.type === \"image/png\" ? \"png\" : \"jpg\";
-  state.photoBlob = file;
-  const url = URL.createObjectURL(file);
-  $(\"preview\").src = url;
-}
+els.btnGeo?.addEventListener("click", async () => {
+  els.btnGeo.disabled = true;
+  els.btnGeo.textContent = "GPS取得中...";
+  try {
+    currentGeo = await new Promise((resolve, reject) => {
+      if (!navigator.geolocation) return reject(new Error("no geolocation"));
+      navigator.geolocation.getCurrentPosition(resolve, reject, {
+        enableHighAccuracy: true,
+        timeout: 12000,
+        maximumAge: 0,
+      });
+    });
+    setGeoUI(currentGeo);
+  } catch (e) {
+    alert("GPS取得に失敗しました。位置情報(許可/精度)を確認して再試行してください。");
+  } finally {
+    els.btnGeo.disabled = false;
+    els.btnGeo.textContent = "GPS取得";
+  }
+});
 
-// ---------- Voice ----------
-function startVoice() {
-  const Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!Rec) return alert(\"このブラウザは音声入力非対応です\");
-  state.voice.recognizer = new Rec();
-  state.voice.recognizer.lang = \"ja-JP\";
-  state.voice.recognizer.interimResults = true;
-  state.voice.recognizer.onstart = () => {
-    state.voice.active = true;
-    $(\"btnVoice\").innerText = \"🛑 音声入力中...\";
-    $(\"voiceWarn\").hidden = false;
+els.btnSave?.addEventListener("click", async () => {
+  if (!currentFile) { alert("写真を選択/撮影してください"); return; }
+  if (!currentGeo) { alert("GPSを取得してください"); return; }
+
+  const ts = currentTs ?? new Date();
+  const base = formatTs(ts);
+
+  // 枝番：同秒の既存件数+1
+  const all = await dbGetAll();
+  const sameSec = all.filter(r => (r.photoName || "").startsWith(base + "-")).length;
+  const seq = sameSec + 1;
+  const photoName = `${base}-${pad2(seq)}.jpg`;
+
+  const blob = currentFile.type?.startsWith("image/") ? currentFile : new Blob([await currentFile.arrayBuffer()], { type: "image/jpeg" });
+
+  const rec = {
+    id: crypto.randomUUID(),
+    createdAt: ts.toISOString(),
+    lat: currentGeo.coords.latitude,
+    lng: currentGeo.coords.longitude,
+    acc: currentGeo.coords.accuracy,
+    memo: (els.memo.value || "").trim(),
+    photoName,
+    photoType: blob.type || "image/jpeg",
+    photoBlob: blob
   };
-  state.voice.recognizer.onresult = (e) => {
-    let final = \"\";
-    for (let i = e.resultIndex; i < e.results.length; i++) {
-      if (e.results[i].isFinal) final += e.results[i][0].transcript;
-    }
-    if (final) $(\"note\").value += final;
-  };
-  state.voice.recognizer.onend = () => stopVoice();
-  state.voice.recognizer.start();
-}
-function stopVoice() {
-  state.voice.active = false;
-  $(\"btnVoice\").innerText = \"🎙 音声入力開始\";
-  $(\"voiceWarn\").hidden = true;
-  if (state.voice.recognizer) state.voice.recognizer.stop();
-}
 
-// ---------- Save ----------
-async function saveCurrent() {
-  if (!state.lat) { alert(\"GPSを取得してください\"); return; }
-  const id = Date.now();
-  const record = {
-    id,
-    ts: state.ts || id,
-    lat: state.lat,
-    lon: state.lon,
-    acc: state.acc,
-    note: $(\"note\").value,
-    photoBlob: state.photoBlob,
-    photoName: state.photoBlob ? `img_${id}.${state.photoExt}` : null
-  };
-  await dbPut(record);
-  // Clear UI
-  state.photoBlob = null;
-  $(\"preview\").src = \"\";
-  $(\"photo\").value = \"\";
-  $(\"note\").value = \"\";
-  renderList();
-  alert(\"保存しました\");
-}
+  try {
+    await dbPut(rec);
+    // reset
+    els.memo.value = "";
+    els.photoInput.value = "";
+    currentFile = null;
+    currentGeo = null;
+    currentTs = null;
+    setGeoUI(null);
+    els.preview.src = "";
+    updateAutoName();
+    await renderList();
+    alert("保存しました");
+  } catch (e) {
+    console.error(e);
+    alert("保存に失敗しました。容量不足の可能性があります。");
+  }
+});
 
-// ---------- UI List ----------
-async function renderList() {
-  const items = await dbGetAll();
-  const container = $(\"list\");
-  container.innerHTML = \"\";
-  items.forEach(r => {
-    const div = document.createElement(\"div\");
-    div.className = \"list-item\";
-    div.innerHTML = `
-      <div style=\"font-size:11px; color:#888\">${new Date(r.ts).toLocaleString()}</div>
-      <div>${r.lat}, ${r.lon} (±${r.acc}m)</div>
-      <div style=\"margin-top:4px\">${r.note || \"(備考なし)\"}</div>
+// ---- List ----
+async function renderList(){
+  const all = await dbGetAll();
+  all.sort((a,b) => (a.createdAt < b.createdAt ? 1 : -1));
+  els.count.textContent = String(all.length);
+  els.list.innerHTML = "";
+
+  for (const r of all.slice(0, 50)) {
+    const wrap = document.createElement("div");
+    wrap.className = "item";
+
+    const img = document.createElement("img");
+    img.className = "thumb";
+    img.alt = "photo";
+    try{
+      const url = URL.createObjectURL(r.photoBlob);
+      img.src = url;
+      img.onload = () => setTimeout(()=>URL.revokeObjectURL(url), 60000);
+    }catch(_){}
+
+    const right = document.createElement("div");
+    right.className = "kv";
+    const d = new Date(r.createdAt);
+
+    right.innerHTML = `
+      <div><b>${r.photoName}</b></div>
+      <div class="small mono">${d.toLocaleString()}</div>
+      <div class="small">lat: ${r.lat.toFixed(7)} / lng: ${r.lng.toFixed(7)} / acc: ${Math.round(r.acc)}m</div>
+      <div class="small">memo: ${escapeHtml(r.memo)}</div>
     `;
-    if (r.photoBlob) {
-      const img = document.createElement(\"img\");
-      img.src = URL.createObjectURL(r.photoBlob);
-      img.className = \"list-thumb\";
-      div.appendChild(img);
+
+    wrap.appendChild(img);
+    wrap.appendChild(right);
+    els.list.appendChild(wrap);
+  }
+}
+
+// ---- ZIP (store) + CRC32 ----
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let i=0;i<256;i++){
+    let c = i;
+    for (let k=0;k<8;k++){
+      c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
     }
-    container.appendChild(div);
-  });
+    t[i] = c >>> 0;
+  }
+  return t;
+})();
+function crc32(u8){
+  let c = 0xFFFFFFFF;
+  for (let i=0;i<u8.length;i++){
+    c = CRC_TABLE[(c ^ u8[i]) & 0xFF] ^ (c >>> 8);
+  }
+  return (c ^ 0xFFFFFFFF) >>> 0;
 }
-
-// ---------- CSV/ZIP Export ----------
-function exportCsvBlob(items) {
-  const header = \"id,time,lat,lon,acc,note,photo\\n\";
-  const rows = items.map(r => {
-    const timeStr = new Date(r.ts).toISOString();
-    const noteEsc = (r.note||\"\").replace(/\\n/g,\" \").replace(/\"/g,'\"\"');
-    return `${r.id},\"${timeStr}\",${r.lat},${r.lon},${r.acc},\"${noteEsc}\",\"${r.photoName||\"\"}\"`;
-  }).join(\"\\n\");
-  return new Blob([\"\\ufeff\" + header + rows], { type: \"text/csv;charset=utf-8\" });
+function u16(n){ return new Uint8Array([n & 255, (n>>>8) & 255]); }
+function u32(n){ return new Uint8Array([n & 255, (n>>>8) & 255, (n>>>16) & 255, (n>>>24) & 255]); }
+function strU8(s){ return new TextEncoder().encode(s); }
+function concatU8(parts){
+  const len = parts.reduce((a,b)=>a+b.length,0);
+  const out = new Uint8Array(len);
+  let off=0;
+  for (const p of parts){ out.set(p, off); off += p.length; }
+  return out;
 }
-
-async function exportCsv() {
-  const items = await dbGetAll();
-  if (items.length === 0) return alert(\"データがありません\");
-  const blob = exportCsvBlob(items);
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement(\"a\");
-  a.href = url;
-  a.download = `fieldlog_${new Date().toISOString().slice(0,10)}.csv`;
-  a.click();
+function dosTime(date){
+  const d = date instanceof Date ? date : new Date(date);
+  const year = d.getFullYear();
+  const mon = d.getMonth()+1;
+  const day = d.getDate();
+  const hr = d.getHours();
+  const min = d.getMinutes();
+  const sec = Math.floor(d.getSeconds()/2);
+  const dt = ((year-1980) << 9) | (mon << 5) | day;
+  const tm = (hr << 11) | (min << 5) | sec;
+  return {dt, tm};
 }
+function makeZip(files){
+  let localParts = [];
+  let centralParts = [];
+  let offset = 0;
 
-async function exportZip() {
-  const JSZip = window.JSZip;
-  if (!JSZip) return alert(\"JSZip読み込みエラー\");
-  
-  const items = await dbGetAll();
-  if (items.length === 0) return alert(\"データがありません\");
+  for (const f of files){
+    const nameU8 = strU8(f.name);
+    const dataU8 = f.data;
+    const c = crc32(dataU8);
+    const {dt, tm} = dosTime(f.mtime || new Date());
 
-  const zip = new JSZip();
-  // CSV追加
-  const csvBlob = exportCsvBlob(items);
-  zip.file(\"data.csv\", csvBlob);
+    const localHeader = concatU8([
+      u32(0x04034b50),
+      u16(20),
+      u16(0),
+      u16(0),
+      u16(tm),
+      u16(dt),
+      u32(c),
+      u32(dataU8.length),
+      u32(dataU8.length),
+      u16(nameU8.length),
+      u16(0),
+      nameU8
+    ]);
+    localParts.push(localHeader, dataU8);
 
-  // 写真追加
-  const folder = zip.folder(\"photos\");
-  for (const r of items) {
-    if (r.photoBlob) {
-      // 修正の肝：awaitを追加
-      await folder.file(r.photoName || `${r.id}.jpg`, r.photoBlob);
-    }
+    const centralHeader = concatU8([
+      u32(0x02014b50),
+      u16(20),
+      u16(20),
+      u16(0),
+      u16(0),
+      u16(tm),
+      u16(dt),
+      u32(c),
+      u32(dataU8.length),
+      u32(dataU8.length),
+      u16(nameU8.length),
+      u16(0),
+      u16(0),
+      u16(0),
+      u16(0),
+      u32(0),
+      u32(offset),
+      nameU8
+    ]);
+    centralParts.push(centralHeader);
+
+    offset += localHeader.length + dataU8.length;
   }
 
-  // ZIP生成
-  const outBlob = await zip.generateAsync({ type: \"blob\" });
-  
-  const url = URL.createObjectURL(outBlob);
-  const a = document.createElement(\"a\");
-  a.href = url;
-  a.download = `fieldlog_${new Date().toISOString().slice(0,10)}.zip`;
-  document.body.appendChild(a);
-  a.click();
-  setTimeout(() => {
-    a.remove();
-    URL.revokeObjectURL(url);
-  }, 100);
+  const centralDir = concatU8(centralParts);
+  const centralOffset = offset;
+  const centralSize = centralDir.length;
+
+  const end = concatU8([
+    u32(0x06054b50),
+    u16(0),
+    u16(0),
+    u16(files.length),
+    u16(files.length),
+    u32(centralSize),
+    u32(centralOffset),
+    u16(0)
+  ]);
+
+  return concatU8([...localParts, centralDir, end]);
 }
 
-// ---------- Setup ----------
-$(\"btnGps\").addEventListener(\"click\", getGps);
-$(\"photo\").addEventListener(\"change\", (e) => onPickPhoto(e.target.files[0]));
-$(\"btnVoice\").addEventListener(\"click\", () => state.voice.active ? stopVoice() : startVoice());
-$(\"btnSave\").addEventListener(\"click\", saveCurrent);
-$(\"btnExportCsv\").addEventListener(\"click\", exportCsv);
-$(\"btnExportZip\").addEventListener(\"click\", exportZip);
-$(\"btnClear\").addEventListener(\"click\", dbClear);
+function downloadBlob(blob, filename){
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.style.display = "none";
+  document.body.appendChild(a);
 
-window.addEventListener(\"DOMContentLoaded\", () => {
-  renderList();
-  if (\"serviceWorker\" in navigator) navigator.serviceWorker.register(\"./sw.js\");
+  requestAnimationFrame(() => {
+    setTimeout(() => {
+      a.click();
+      setTimeout(() => {
+        URL.revokeObjectURL(url);
+        a.remove();
+      }, 5000);
+    }, 50);
+  });
+}
+
+els.btnExportZip?.addEventListener("click", async () => {
+  els.btnExportZip.disabled = true;
+  els.exportStatus.textContent = "ZIP生成中...";
+  try {
+    const all = await dbGetAll();
+    if (all.length === 0) { alert("保存データがありません"); return; }
+
+    const header = ["photo","createdAt","lat","lng","acc","memo"];
+    const rows = [header.join(",")];
+    for (const r of all){
+      rows.push([
+        escCsv(r.photoName),
+        escCsv(r.createdAt),
+        escCsv(r.lat),
+        escCsv(r.lng),
+        escCsv(Math.round(r.acc)),
+        escCsv(r.memo)
+      ].join(","));
+    }
+    const csvText = "\uFEFF" + rows.join("\r\n");
+    const csvU8 = strU8(csvText);
+
+    const files = [];
+    files.push({ name: "records.csv", data: csvU8, mtime: new Date() });
+
+    for (const r of all){
+      const ab = await r.photoBlob.arrayBuffer();
+      const u8 = new Uint8Array(ab);
+      files.push({ name: "photos/" + r.photoName, data: u8, mtime: new Date(r.createdAt) });
+    }
+
+    const zipU8 = makeZip(files);
+    const zipBlob = new Blob([zipU8], { type: "application/zip" });
+
+    const zipName = `survey_export_${formatTs(new Date())}.zip`;
+    downloadBlob(zipBlob, zipName);
+    els.exportStatus.textContent = "ZIPを書き出しました: " + zipName;
+  } catch (e) {
+    console.error(e);
+    alert("ZIP書き出しに失敗しました。");
+    els.exportStatus.textContent = "失敗しました";
+  } finally {
+    els.btnExportZip.disabled = false;
+  }
 });
+
+els.btnClear?.addEventListener("click", async () => {
+  if (!confirm("全データを削除します。よろしいですか？")) return;
+  await dbClear();
+  await renderList();
+  alert("削除しました");
+});
+
+// First render
+(async function(){
+  updateAutoName();
+  await renderList();
+  try { els.swState.textContent += " / " + location.origin; } catch(_){}
+})();
